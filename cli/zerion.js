@@ -5,6 +5,10 @@
  * Routes argv to command handlers via the router.
  */
 
+// Must stay first: exits with a structured error on unsupported Node versions
+// before any dependency gets a chance to crash while loading.
+import "./utils/common/check-node.js";
+
 import { register, registerSingle, dispatch } from "./router.js";
 import { printError, setPrettyMode } from "./utils/common/output.js";
 import { migrateFromZerionCli } from "./utils/common/migrate.js";
@@ -21,9 +25,12 @@ if (process.argv.includes("--pretty") || (process.stdout.isTTY && !process.argv.
 
 import walletCreate from "./commands/wallet/create.js";
 import walletImport from "./commands/wallet/import.js";
+import walletAdd from "./commands/wallet/add.js";
+import walletSetReviewThreshold from "./commands/wallet/set-review-threshold.js";
 import walletList from "./commands/wallet/list.js";
 import walletFund from "./commands/wallet/fund.js";
 import walletBackup from "./commands/wallet/backup.js";
+import walletExportKey from "./commands/wallet/export-key.js";
 import walletDelete from "./commands/wallet/delete.js";
 import walletSync from "./commands/wallet/sync.js";
 import walletSignMessage from "./commands/wallet/sign-message.js";
@@ -31,9 +38,12 @@ import walletSignTypedData from "./commands/wallet/sign-typed-data.js";
 import watch from "./commands/wallet/watch.js";
 register("wallet", "create", walletCreate);
 register("wallet", "import", walletImport);
+register("wallet", "add", walletAdd);
+register("wallet", "set-review-threshold", walletSetReviewThreshold);
 register("wallet", "list", walletList);
 register("wallet", "fund", walletFund);
 register("wallet", "backup", walletBackup);
+register("wallet", "export-key", walletExportKey);
 register("wallet", "delete", walletDelete);
 register("wallet", "sync", walletSync);
 registerSingle("sign-message", walletSignMessage);
@@ -58,6 +68,8 @@ registerSingle("analyze", analyze);
 import swap from "./commands/trading/swap.js";
 import bridge from "./commands/trading/bridge.js";
 import send from "./commands/trading/send.js";
+import consolidate from "./commands/trading/consolidate.js";
+import bundleCmd from "./commands/trading/bundle.js";
 import swapTokens from "./commands/trading/list-tokens.js";
 import search from "./commands/trading/search.js";
 import chainsCmd from "./commands/trading/chains.js";
@@ -65,6 +77,8 @@ registerSingle("swap", swap);
 register("swap", "tokens", swapTokens);
 registerSingle("bridge", bridge);
 registerSingle("send", send);
+registerSingle("consolidate", consolidate);
+registerSingle("bundle", bundleCmd);
 registerSingle("search", search);
 registerSingle("chains", chainsCmd);
 
@@ -101,6 +115,11 @@ registerSingle("setup", setupCmd);
 
 import initCmd from "./commands/init.js";
 registerSingle("init", initCmd);
+
+// --- Login (browser / API-key authentication) ---
+
+import loginCmd from "./commands/login.js";
+registerSingle("login", loginCmd);
 
 // --- Dispatch ---
 

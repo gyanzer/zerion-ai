@@ -3,45 +3,49 @@
  */
 
 import { createInterface } from "node:readline";
+import { readFileSync, statSync } from "node:fs";
 
 export function readSecret(prompt, { mask = false } = {}) {
   return new Promise((resolve) => {
     process.stderr.write(prompt);
 
-    // If masking and stdin is a TTY, use raw mode to replace each keystroke with *
+    // Hidden input, the way sudo and ssh do it: nothing is drawn while typing.
+    // readline gives this for free — `terminal: true` turns on its raw-mode line
+    // editing (pastes, backspace, arrow keys, kill-line, Ctrl-C/Ctrl-D) while a
+    // null `output` means it echoes nothing at all. Don't swap in a no-op
+    // output stream instead: readline writes its cursor/clear escapes straight
+    // to output, and the clear-to-end-of-screen one wipes the prompt away.
     if (mask && process.stdin.isTTY) {
-      let input = "";
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdin.setEncoding("utf8");
+      const rl = createInterface({
+        input: process.stdin,
+        output: null,
+        terminal: true,
+        historySize: 0, // never keep a secret in readline's history
+      });
 
-      const onData = (ch) => {
-        if (ch === "\n" || ch === "\r" || ch === "\u0004") {
-          // Enter or Ctrl-D — done
-          process.stdin.setRawMode(false);
-          process.stdin.pause();
-          process.stdin.removeListener("data", onData);
-          process.stderr.write("\n");
-          resolve(input.trim());
-        } else if (ch === "\u0003") {
-          // Ctrl-C — abort
-          process.stdin.setRawMode(false);
-          process.stdin.pause();
-          process.stderr.write("\n");
-          process.exit(130);
-        } else if (ch === "\u007F" || ch === "\b") {
-          // Backspace
-          if (input.length > 0) {
-            input = input.slice(0, -1);
-            process.stderr.write("\b \b");
-          }
-        } else {
-          input += ch;
-          process.stderr.write("*");
-        }
+      // close() re-emits `close`, so guard: without this the first resolve wins
+      // and a plain Enter would hand back "" instead of the secret.
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        rl.close();
+        process.stderr.write("\n");
+        resolve(value);
       };
 
-      process.stdin.on("data", onData);
+      rl.on("line", (line) => finish(line.trim()));
+
+      // Ctrl-D at an empty prompt closes without emitting `line`; resolve empty
+      // so the caller's own validation reports it instead of hanging forever.
+      rl.on("close", () => finish(""));
+
+      // Once something listens for SIGINT, readline stops letting Ctrl-C kill
+      // the process, so exit here — after close() has restored the terminal.
+      rl.on("SIGINT", () => {
+        finish("");
+        process.exit(130);
+      });
       return;
     }
 
@@ -53,7 +57,6 @@ export function readSecret(prompt, { mask = false } = {}) {
     });
   });
 }
-
 /**
  * Prompt for a passphrase with optional confirmation (enter twice).
  * Requires an interactive terminal — passphrase must always be entered by a human.
@@ -80,6 +83,66 @@ export async function readPassphrase({ confirm = false } = {}) {
 
     return passphrase;
   }
+}
+
+/**
+ * Read a passphrase from a file. Used for non-interactive automation
+ * (CI, headless servers, scripted agent setup).
+ *
+ * Security: on POSIX, refuse to read the file unless it is mode 0600
+ * AND owned by the current uid. The passphrase unlocks the keystore —
+ * same threat model as an SSH private key, same perm + ownership
+ * requirement. Without the uid check, a symlink at the given path
+ * could resolve to another user's 0600 file on a shared host. Perm
+ * and ownership checks are skipped on Windows (POSIX mode bits and
+ * uid are not meaningful there; use NTFS ACLs instead).
+ *
+ * Strips exactly one trailing newline (\n or \r\n) — passphrases may
+ * legitimately contain leading/trailing spaces, so don't .trim().
+ */
+export function readPassphraseFromFile(path) {
+  let stat;
+  try {
+    stat = statSync(path);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      throw new Error(`Passphrase file not found: ${path}`);
+    }
+    throw new Error(`Cannot read passphrase file: ${err.message}`);
+  }
+
+  if (!stat.isFile()) {
+    throw new Error(`Passphrase file is not a regular file: ${path}`);
+  }
+
+  if (process.platform !== "win32") {
+    if ((stat.mode & 0o077) !== 0) {
+      const got = (stat.mode & 0o777).toString(8).padStart(3, "0");
+      throw new Error(
+        `Passphrase file ${path} has insecure permissions (mode ${got}). ` +
+          `Run: chmod 600 ${path}`
+      );
+    }
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+      throw new Error(
+        `Passphrase file ${path} is not owned by the current user (uid ${stat.uid}). ` +
+          `Refusing to read another user's file.`
+      );
+    }
+  }
+
+  const raw = readFileSync(path, "utf8");
+  const passphrase = raw.endsWith("\r\n")
+    ? raw.slice(0, -2)
+    : raw.endsWith("\n")
+      ? raw.slice(0, -1)
+      : raw;
+
+  if (!passphrase) {
+    throw new Error(`Passphrase file is empty: ${path}`);
+  }
+
+  return passphrase;
 }
 
 /**

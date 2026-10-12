@@ -1,6 +1,10 @@
-import { getSwapQuote, executeSwap } from "../../utils/trading/swap.js";
-import { requireAgentToken, parseTimeout, handleTradingError } from "../../utils/trading/guards.js";
+import { getSwapQuote, executeSwap, executeViaWebApp, buildSwapWebAppGroup, quoteOnlyResult } from "../../utils/trading/swap.js";
+import { requireAgentToken, parseTimeout, parseSlippage, handleTradingError } from "../../utils/trading/guards.js";
 import { resolveWallet } from "../../utils/wallet/resolve.js";
+import { reportHandoff } from "../../utils/web-app/handoff.js";
+import { buildPreparedGroup, printPreparedGroup } from "../../utils/web-app/prepared-group.js";
+import { decideSigningRoute } from "../../utils/trading/signing-route.js";
+import { bundleSellUsd } from "../../utils/trading/valuation.js";
 import { print, printError } from "../../utils/common/output.js";
 import { formatSwapQuote } from "../../utils/common/format.js";
 import { validateTradingChainAsync } from "../../utils/common/validate.js";
@@ -30,6 +34,13 @@ export default async function swap(args, flags) {
     process.exit(1);
   }
 
+  if (flags.quote && flags.prepare) {
+    printError("conflicting_flags", "--quote only prices the swap; --prepare builds an envelope. Pick one.", {
+      example: `zerion swap ${chain} ${amount} ${fromToken} ${toToken} --quote`,
+    });
+    process.exit(1);
+  }
+
   // Source wallet resolves against `chain` so Solana picks base58 and EVM
   // picks 0x.
   const { walletName, address } = resolveWallet({ ...flags, chain });
@@ -49,15 +60,8 @@ export default async function swap(args, flags) {
       toChain: chain,
       walletAddress: address,
       outputReceiver: address,
-      slippage: flags.slippage ? parseFloat(flags.slippage) : undefined,
+      slippage: parseSlippage(flags.slippage),
     });
-
-    if (quote.preconditions.enough_balance === false) {
-      printError("insufficient_funds", `Insufficient ${quote.from.symbol} balance for this swap`, {
-        suggestion: `Fund your wallet: zerion wallet fund --wallet ${walletName}`,
-      });
-      process.exit(1);
-    }
 
     const quoteSummary = {
       swap: {
@@ -72,18 +76,58 @@ export default async function swap(args, flags) {
       },
     };
 
-    const passphrase = await requireAgentToken("for trading", walletName);
-    const timeout = parseTimeout(flags.timeout);
-    const result = await executeSwap(quote, walletName, passphrase, { timeout });
+    // --quote: price only, so it runs before the balance gate — the tokens may
+    // come from an earlier leg that hasn't confirmed. Builds and signs nothing.
+    if (flags.quote) {
+      print(quoteOnlyResult(quoteSummary, quote), formatSwapQuote);
+      return;
+    }
 
+    // Balance precondition gate — runs regardless of signing route.
+    if (quote.preconditions.enough_balance === false) {
+      printError("insufficient_funds", `Insufficient ${quote.from.symbol} balance for this swap`, {
+        suggestion: `Fund your wallet: zerion wallet fund --wallet ${walletName}, or price it without the balance check: --quote`,
+      });
+      process.exit(1);
+    }
+
+    const timeout = parseTimeout(flags.timeout);
+
+    // Sell-side USD value drives routing (swap = inputAmount × price(from)).
+    const usdValue = await bundleSellUsd({ fungibleId: quote.from.fungibleId, amount });
+    const { route, reason } = decideSigningRoute({ walletName, force: flags.review, usdValue });
+    process.stderr.write(`Signing route: ${route} — ${reason}.\n`);
+
+    // --prepare: run the full build + gate pipeline but emit a nonce-free
+    // prepared-group envelope instead of executing. Defers to `zerion bundle`.
+    if (flags.prepare) {
+      const group = await buildSwapWebAppGroup(quote, { address, assignNonces: false });
+      printPreparedGroup(buildPreparedGroup({
+        ecosystem: group.ecosystem,
+        chain: group.chain,
+        address: group.from,
+        walletName,
+        route,
+        summary: quoteSummary,
+        transactions: group.transactions,
+        outflows: group.outflows,
+      }));
+      return;
+    }
+
+    if (route === "web-app") {
+      const result = await executeViaWebApp(quote, { address, timeout });
+      reportHandoff(quoteSummary, result);
+      return;
+    }
+
+    // Local route — unlock the keystore and sign/broadcast locally.
+    const passphrase = await requireAgentToken("for trading", walletName);
+    const result = await executeSwap(quote, walletName, passphrase, { timeout });
     print({
       ...quoteSummary,
-      tx: {
-        hash: result.hash,
-        status: result.status,
-        blockNumber: result.blockNumber,
-        gasUsed: result.gasUsed,
-      },
+      signedVia: "local",
+      tx: { hash: result.hash, status: result.status, blockNumber: result.blockNumber, gasUsed: result.gasUsed },
       executed: true,
     }, formatSwapQuote);
   } catch (err) {

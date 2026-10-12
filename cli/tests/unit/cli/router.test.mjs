@@ -55,7 +55,8 @@ describe("CLI routing", () => {
     it("shows version with --version", async () => {
       const { code, stdout } = await run(["--version"]);
       assert.equal(code, 0);
-      assert.match(stdout.trim(), /^\d+\.\d+\.\d+$/);
+      // Also accept prerelease versions (e.g. 2.0.0-rc.1)
+      assert.match(stdout.trim(), /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/);
     });
   });
 

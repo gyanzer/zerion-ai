@@ -25,9 +25,12 @@ function printUsage() {
       "wallet import --name <name> --evm-key": "Import from EVM private key (interactive)",
       "wallet import --name <name> --sol-key": "Import from Solana private key (interactive)",
       "wallet import --name <name> --mnemonic": "Import from seed phrase (all chains)",
-      "wallet list": "List all wallets",
+      "wallet add <address|ens> --name <name>": "Add a read-only wallet — address only, no keys (0x, ENS, or Solana base58). Reads work normally; ALL signing hands off to the web app, so trades can't run unattended",
+      "wallet set-review-threshold <wallet> <usd|off>": "Route transactions whose sell-side value is over <usd> to the web app for human review instead of auto-signing ('off' clears it; fails closed when value is unknown)",
+      "wallet list": "List all wallets (keystore + read-only)",
       "wallet fund": "Show deposit addresses for funding",
       "wallet backup --wallet <name>": "Export recovery phrase (mnemonic backup)",
+      "wallet export-key --wallet <name>": "Export raw private key(s) derived from mnemonic (--chain evm|solana|all, --index N)",
       "wallet delete <name>": "Permanently delete a wallet (requires passphrase)",
       "wallet sync --wallet <name>": "Sync wallet to Zerion app via QR code",
       "wallet sync --all": "Sync all wallets to Zerion app",
@@ -38,11 +41,12 @@ function printUsage() {
       "sign-typed-data --data '<json>'": "Sign EIP-712 typed data (EVM only)",
       "sign-typed-data --file <path>": "Read EIP-712 typed data from file",
       "cat typed.json | sign-typed-data": "Read EIP-712 typed data from stdin",
+      "sign-message / sign-typed-data --review": "Route the signature to the web app for human review (read-only wallets always do; sign-message supports EVM + Solana, sign-typed-data is EVM only)",
     },
     analysis: {
       "analyze <address|name>": "Full analysis (portfolio, positions, txs, PnL in parallel)",
       "portfolio <address|name>": "Portfolio value and top positions",
-      "positions <address|name>": "Token + DeFi positions (--positions all|simple|defi)",
+      "positions <address|name>": "Token + DeFi positions (--positions all|simple|defi, or --defi for grouped DeFi view)",
       "history <address|name>": "Transaction history (--limit <n>, --chain <chain>)",
       "pnl <address|name>": "Profit & loss (realized, unrealized, fees)",
     },
@@ -50,14 +54,21 @@ function printUsage() {
       "swap <chain> <amount> <from-token> <to-token>": "Same-chain token swap (e.g. zerion swap base 1 USDC ETH)",
       "swap solana <amount> <from-token> <to-token>": "Solana same-chain swap (e.g. zerion swap solana 0.1 SOL USDC)",
       "swap tokens [chain]": "List tokens available for swap",
+      "swap <chain> <amount> <from-token> <to-token> --quote": "Price a swap without executing — works before the wallet holds the input token (e.g. tokens a claim will deliver)",
       "bridge <from-chain> <from-token> <amount> <to-chain> <to-token>": "Cross-chain bridge / bridge+swap (e.g. zerion bridge base USDC 5 arbitrum USDC)",
       "bridge <from-chain> <from-token> <amount> <to-chain> <to-token> --to-wallet <name>": "Bridge with explicit destination wallet (Solana ↔ EVM)",
       "bridge <from-chain> <from-token> <amount> <to-chain> <to-token> --to-address <addr>": "Bridge to a raw destination address (chain-format must match)",
+      "bridge <from-chain> <from-token> <amount> <to-chain> <to-token> --quote": "List every route and its price without executing — even a single route, which plain `bridge` would execute",
       "send <token> <amount> --to <addr> [--chain <chain>]": "Send native ETH/SOL or ERC-20 to an address (chain auto-detected from address format)",
+      "consolidate <chain> <to-token>": "Sweep all wallet positions on <chain> into <to-token> (dry-run by default; --execute to broadcast LOCALLY; --concurrency <n> for plan-phase quote concurrency, auto-picked by API-key tier)",
+      "<send|swap|bridge|consolidate> ... --prepare": "Build + gate a command but emit a nonce-free prepared-group envelope to stdout instead of executing (for `zerion bundle`)",
+      "bundle --group <envelope> [--group <envelope> ...]": "Sign several prepared groups together in one web-app handoff (or locally when all auto-sign); same signer address, per-group results",
       "search <query>": "Search for tokens by name or symbol",
+      "_signing_route": "swap/bridge/send sign locally by default, or hand off to app.zerion.io for human review (read-only wallet, value over the review threshold, or --review); consolidate --execute is always local — see capabilities/trading.md",
     },
     agent_tokens: {
       "agent create-token --name <bot> --wallet <wallet>": "Create scoped API token for unattended trading",
+      "agent create-token --name <bot> --wallet <wallet> --passphrase-file <path>": "Non-interactive: <path> is a plain-text file whose contents are the wallet passphrase (must be mode 0600, owned by you, UTF-8, one optional trailing newline stripped)",
       "agent list-tokens": "List active agent tokens",
       "agent use-token --wallet <wallet>": "Switch active agent token by wallet",
       "agent revoke-token --name <bot>": "Revoke an agent token",
@@ -76,7 +87,7 @@ function printUsage() {
       "analyze <name|address>": "Analyze wallet trading activity",
     },
     other: {
-      "chains": "List supported chains",
+      "chains": "List supported chains: Zerion id, EVM chain id (decimal + hex), trade/bridge/send support, and public RPC URLs (--json)",
       "config set <key> <value>": "Set config (apiKey, defaultWallet, defaultChain, slippage)",
       "config unset <key>": "Remove a config value (resets to default)",
       "config list": "Show current configuration",
@@ -89,10 +100,16 @@ function printUsage() {
       "--to-wallet <name>": "Destination wallet for bridge (Solana ↔ EVM)",
       "--to-address <addr>": "Destination address for bridge (must match destination-chain format)",
       "--positions all|simple|defi": "Filter positions type",
+      "--defi": "Shorthand for --positions defi with grouped-by-protocol output (loans netted, LP tokens pooled)",
       "--limit <n>": "Limit results (transactions, wallet list; default: 20 for list)",
       "--offset <n>": "Skip first N results (pagination for wallet list)",
       "--search <query>": "Filter wallets by name or address",
       "--slippage <percent>": "Slippage tolerance (default: 2%)",
+      "--review": "Force this trade to the web app for human review instead of auto-signing (see trading._signing_route)",
+      "--timeout <sec>": "Wait budget: broadcast confirmation on the local route (default 120), or the browser-callback wait on a web-app handoff (default 300)",
+      "--prepare": "Emit a prepared-group envelope (send/swap/bridge/consolidate) for `zerion bundle` instead of executing",
+      "--quote": "swap/bridge: print the price (bridge: every route) and stop, skipping the balance check — indicative when the wallet doesn't hold the input token yet",
+      "--group <envelope>": "A prepared-group envelope for `zerion bundle` (repeatable)",
       "--x402": "Use x402 pay-per-call on Base or Solana — analytics commands only (no API key needed)",
       "--mpp": "Use MPP pay-per-call on Tempo — analytics commands only (no API key needed)",
       "--json": "JSON output (default)",
@@ -107,7 +124,8 @@ function printUsage() {
       "--allowlist <addresses>": "Only allow interaction with listed addresses",
     },
     env: {
-      "ZERION_API_KEY": "API key (get at dashboard.zerion.io)",
+      "ZERION_API_KEY": "API key (get at dashboard.zerion.io, or run `zerion login`)",
+      "ZERION_DASHBOARD_URL": "Override the dashboard base URL for `zerion login` / `init` (default: https://dashboard.zerion.io)",
       "WALLET_PRIVATE_KEY": "Private key for pay-per-call: 0x-hex → x402 on Base; base58 → x402 on Solana; 0x-hex → also works for MPP",
       "EVM_PRIVATE_KEY": "EVM private key for x402 on Base (overrides WALLET_PRIVATE_KEY for EVM)",
       "SOLANA_PRIVATE_KEY": "Solana private key for x402 on Solana (overrides WALLET_PRIVATE_KEY for Solana)",
@@ -123,27 +141,45 @@ function printUsage() {
       "defaultWallet": "Default wallet for all commands",
       "defaultChain": "Default chain (default: ethereum)",
       "slippage": "Default slippage % for swaps (default: 2)",
+      "reviewThresholds": "Per-wallet USD human-review ceilings — set with `wallet set-review-threshold`, not `config set`",
     },
     setup: {
-      "init": "One-shot onboarding: install CLI globally, configure API key, install agent skills",
-      "init -y --browser": "Non-interactive init that opens dashboard.zerion.io for the API key",
+      "login": "Authenticate — browser (dashboard) login, paste an API key, or pay-per-call",
+      "login --browser": "Browser authentication: opens dashboard.zerion.io, captures the key via loopback",
+      "init": "One-shot onboarding: install CLI globally, browser login, install agent skills (`npx zerion-cli@latest init`)",
+      "init -y": "Same without prompts: browser login, then install every skill",
+      "init --no-open": "Print the authorize URL instead of opening a browser (remote / headless hosts)",
       "setup skills": "Install Zerion agent skills via `npx skills add zeriontech/zerion-ai` (45+ hosts)",
     },
+    // Trading-supported chains (swap/bridge/send). Mirrors Zerion API
+    // /chains/ flags.supports_trading=true at time of release. For the live
+    // list, run `zerion chains` — that hits the API and is always current.
     chains: [
-      "ethereum", "base", "arbitrum", "optimism", "polygon",
-      "binance-smart-chain", "avalanche", "gnosis", "scroll",
-      "linea", "zksync-era", "zora", "blast", "solana"
+      "abstract", "ape", "arbitrum", "avalanche", "base", "berachain",
+      "binance-smart-chain", "blast", "bob", "celo", "cyber", "ethereum",
+      "fraxtal", "hyperevm", "ink", "katana", "lens", "linea", "lisk",
+      "manta-pacific", "mantle", "megaeth", "metis-andromeda", "mode",
+      "monad", "opbnb", "optimism", "plasma", "polygon", "rari", "ronin",
+      "scroll", "sei", "solana", "soneium", "sonic", "swellchain", "taiko",
+      "tomochain", "unichain", "world", "xdai", "zero", "zksync-era", "zora",
     ],
   };
   process.stdout.write(JSON.stringify(usage, null, 2) + "\n");
 }
 
 export async function dispatch(argv) {
-  const { rest, flags } = parseFlags(argv);
+  let { rest, flags } = parseFlags(argv);
 
-  // Handle shorthand flags (-h, -v) that the flag parser treats as positional
+  // Handle shorthand flags (-h, -v, -y) that the flag parser treats as
+  // positional. `-y` matters most for `init`/`setup`, whose help advertises it:
+  // without this it was silently dropped and `init -y` still prompted. It's
+  // also filtered out of the positional args, since no command takes it as one.
   if (rest.includes("-h")) flags.help = true;
   if (rest.includes("-v")) flags.version = true;
+  if (rest.includes("-y")) {
+    flags.yes = true;
+    rest = rest.filter((arg) => arg !== "-y");
+  }
 
   if (flags.version || flags.v) {
     const { readFileSync } = await import("node:fs");

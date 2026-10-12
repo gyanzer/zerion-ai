@@ -19,10 +19,12 @@ import {
   getPublicClient,
 } from "./transaction.js";
 import { signAndBroadcastSolana } from "../chain/solana.js";
+import { solanaReceiptAdapter } from "../chain/solana-handoff.js";
 import { isSolana } from "../chain/registry.js";
 import { getConfigValue } from "../config.js";
 import { DEFAULT_SLIPPAGE } from "../common/constants.js";
 import { enforceExecutablePolicies } from "./guards.js";
+import { toTransactionEVM, toSolanaTransaction, signViaWebApp } from "../web-app/handoff.js";
 
 const ERC20_ALLOWANCE_ABI = parseAbi([
   "function allowance(address owner, address spender) view returns (uint256)",
@@ -72,10 +74,8 @@ async function hasSufficientAllowance({ zerionChainId, approveTx, owner }) {
   }
 }
 
-/**
- * Get a swap/bridge quote from Zerion API.
- */
-export async function getSwapQuote({
+// Build the /swap/quotes/ params and resolve the from/to tokens once.
+async function buildQuoteRequest({
   fromToken,
   toToken,
   amount,
@@ -100,44 +100,24 @@ export async function getSwapQuote({
     "slippage_percent": slippage ?? getConfigValue("slippage") ?? DEFAULT_SLIPPAGE,
   };
 
-  // Cross-chain destinations are passed as the top-level `to` param, NOT
-  // `output[to]`. /swap/quotes/ defaults `to` to `from` when omitted, which
-  // breaks Solana ↔ EVM bridges (chain types don't match). Always send `to`
-  // when we have one different from `from`.
-  if (outputReceiver && outputReceiver !== walletAddress) {
-    params.to = outputReceiver;
-  }
+  // The /swap/quotes/ endpoint requires `to` on every request — it used to
+  // default to `from` when omitted, but the API now rejects with
+  // "'to' is required". Always send it. For same-wallet bridges this is
+  // the source signer's address on the destination chain (resolved by
+  // resolveDestination upstream); for Solana ↔ EVM it's the user-provided
+  // receiver. Receivers must be passed at the top level, NOT `output[to]`.
+  params.to = outputReceiver || walletAddress;
 
-  const response = await api.getSwapQuotes(params);
-  const offers = response.data || [];
+  return { params, fromResolved, toResolved };
+}
 
-  if (offers.length === 0) {
-    const err = new Error(
-      `No swap route found for ${amount} ${fromResolved.symbol} → ${toResolved.symbol} on ${fromChain}. ` +
-      `Minimum swap is ~$1. ` +
-      `Check your balance and chain with: zerion portfolio`
-    );
-    err.code = "no_route";
-    err.suggestion = `Try a smaller amount or different pair: zerion swap ${fromChain} 0.001 ETH USDC`;
-    throw err;
-  }
-
-  // Pick the first offer that has executable transaction data. The API may
-  // return offers with `error` set (e.g. not_enough_input_asset_balance) —
-  // those carry no transaction_swap and aren't actionable.
-  const executable = offers.find((o) => {
-    const a = o.attributes || {};
-    if (a.error) return false;
-    return Boolean(a.transaction_swap?.evm || a.transaction_swap?.solana);
-  });
-  const best = executable || offers[0];
-  const attrs = best.attributes || {};
-
-  // Surface the API's blocking error before downstream code tries to sign.
+// Shape an API offer into our internal quote object. Heavy enough to share
+// between single-quote selection and the offers-list view.
+function offerToQuote(offer, { fromResolved, toResolved, fromChain, toChain, amount, walletAddress, outputReceiver }) {
+  const attrs = offer.attributes || {};
   const blocking = attrs.error;
-
   return {
-    id: best.id,
+    id: offer.id,
     from: fromResolved,
     to: toResolved,
     inputAmount: amount,
@@ -150,8 +130,6 @@ export async function getSwapQuote({
       networkAmount: attrs.network_fee?.amount?.quantity,
     },
     liquiditySource: attrs.liquidity_source?.name,
-    // Translate the new error shape into the boolean preconditions our
-    // commands check before signing.
     preconditions: {
       enough_balance: blocking?.code !== "not_enough_input_asset_balance",
     },
@@ -166,6 +144,223 @@ export async function getSwapQuote({
   };
 }
 
+function isExecutable(offer) {
+  const a = offer.attributes || {};
+  if (a.error) return false;
+  return Boolean(a.transaction_swap?.evm || a.transaction_swap?.solana);
+}
+
+// Offer selection strategies — operate on RAW API offers (`offer.attributes…`).
+//   "cheapest": highest net `output_amount` (matches API's default sort).
+//   "fast":     lowest `estimated_time_seconds`. Offers with no time data
+//               fall back to "cheapest" ordering.
+// Both strategies prefer executable offers; non-executable offers (e.g.
+// `error: not_enough_input_asset_balance`) only win when nothing else is
+// available so the caller can surface the blocking error.
+export function selectOffer(offers, strategy = "cheapest") {
+  if (!offers.length) return null;
+
+  const executable = offers.filter(isExecutable);
+  const pool = executable.length ? executable : offers;
+
+  if (strategy === "fast") {
+    const timed = pool.filter((o) => Number.isFinite(o.attributes?.estimated_time_seconds));
+    if (timed.length) {
+      return timed.reduce((best, o) =>
+        o.attributes.estimated_time_seconds < best.attributes.estimated_time_seconds ? o : best
+      );
+    }
+    // No time data on any offer — fall through to cheapest.
+  }
+
+  // "cheapest" — pick max output_amount.quantity. parseFloat returns NaN for
+  // non-numeric strings; treat any non-finite (NaN, Infinity, missing) as
+  // ineligible so a malformed first offer can't anchor the reducer and beat
+  // every later candidate.
+  const numericOut = (o) => {
+    const n = parseFloat(o.attributes?.output_amount?.quantity);
+    return Number.isFinite(n) ? n : -Infinity;
+  };
+  return pool.reduce((best, o) => (numericOut(o) > numericOut(best) ? o : best));
+}
+
+// True iff the quote can be signed and broadcast: no API-side blocking
+// error AND a transaction payload is present. `bridge` reuses this so the
+// "executable" flag in list-mode output matches what `pickOffer` would
+// actually select — otherwise a no-error/no-tx offer would render as
+// `ready` and silently get skipped at execution time.
+export function isQuoteExecutable(quote) {
+  if (!quote || quote.blocking != null) return false;
+  return Boolean(quote.transactionSwap || quote.transactionSwapSolana);
+}
+
+// When the balance is short the API builds no transaction, which leaves network
+// gas and the protocol fee out of a quote — it's indicative until re-quoted.
+const INDICATIVE_PRICE_NOTE =
+  "Indicative: the wallet doesn't hold enough of the input token yet, so network gas " +
+  "and the protocol fee aren't included. Re-quote once the tokens arrive.";
+
+// Result for `swap --quote`: the price, and whether the wallet could execute
+// it now. The point is pricing tokens the wallet doesn't hold yet (an earlier
+// claim or unstake delivers them), so the balance gate is skipped.
+export function quoteOnlyResult(summary, quote) {
+  const enoughBalance = quote.preconditions?.enough_balance !== false;
+  return {
+    ...summary,
+    quoteOnly: true,
+    enoughBalance,
+    ...(quote.blocking && { blocking: quote.blocking }),
+    ...(!enoughBalance && { note: INDICATIVE_PRICE_NOTE }),
+  };
+}
+
+// True when no offer is executable and the only reason is a short input
+// balance — `bridge` refuses then, unless it's only pricing (`--quote`).
+export function allOffersShortOfBalance(offers) {
+  if (offers.length === 0 || offers.some(isQuoteExecutable)) return false;
+  const codes = new Set(offers.map((o) => o.blocking?.code).filter(Boolean));
+  return codes.size === 1 && codes.has("not_enough_input_asset_balance");
+}
+
+// `bridge` lists offers instead of executing: by default when several come
+// back and no strategy is picked, and always with `--quote` — even a single
+// offer, which would otherwise auto-execute.
+export function shouldListBridgeOffers({ quoteOnly, strategy, offerCount }) {
+  return Boolean(quoteOnly) || (!strategy && offerCount > 1);
+}
+
+// The `bridge` offers listing. With `quoteOnly`, says so and flags a price that
+// can't account for gas yet because the wallet doesn't hold the tokens.
+export function bridgeOffersResult(context, offers, { quoteOnly = false } = {}) {
+  const list = offers.map((q) => ({
+    provider: q.liquiditySource,
+    estimatedOutput: q.estimatedOutput,
+    estimatedSeconds: q.estimatedSeconds,
+    fee: q.fee,
+    // Match pickOffer's selection logic — an offer with no blocking error but
+    // missing transaction data would otherwise show as `ready` here and get
+    // silently skipped at execution.
+    executable: isQuoteExecutable(q),
+    blocking: q.blocking,
+  }));
+  const shortOfBalance = allOffersShortOfBalance(offers);
+  return {
+    ...context,
+    offers: list,
+    count: list.length,
+    ...(quoteOnly && {
+      quoteOnly: true,
+      enoughBalance: !shortOfBalance,
+      ...(shortOfBalance && { note: INDICATIVE_PRICE_NOTE }),
+    }),
+    hint: quoteOnly
+      ? "Prices only — nothing was built or signed. Re-run without --quote, with --fast or --cheapest, to execute."
+      : "Re-run with --fast or --cheapest to execute. Use --cheapest for highest output, --fast for lowest time.",
+    executed: false,
+  };
+}
+
+// Mapped-quote selection — same strategy semantics as selectOffer, but works
+// on the post-`offerToQuote` shape so callers (`bridge`) don't have to refetch
+// the API to get a single quote after listing offers.
+//
+// Selection order:
+//   1. If any executable quote exists → pick from those by strategy.
+//   2. Else if any blocked quote has a real API error → return the
+//      highest-output one so executeSwap can surface that error message.
+//   3. Else (only no-tx / no-error quotes) → return null. The caller
+//      treats this as no_route, which is correct: nothing in the response
+//      is signable AND nothing in the response carries actionable info.
+export function pickOffer(quotes, strategy = "cheapest") {
+  if (!quotes.length) return null;
+
+  const out = (q) => {
+    const n = parseFloat(q.estimatedOutput);
+    return Number.isFinite(n) ? n : -Infinity;
+  };
+
+  const executable = quotes.filter(isQuoteExecutable);
+  if (executable.length) {
+    if (strategy === "fast") {
+      const timed = executable.filter((q) => Number.isFinite(q.estimatedSeconds));
+      if (timed.length) {
+        return timed.reduce((best, q) => (q.estimatedSeconds < best.estimatedSeconds ? q : best));
+      }
+    }
+    return executable.reduce((best, q) => (out(q) > out(best) ? q : best));
+  }
+
+  // No executable quotes — surface the best blocked-with-error candidate so
+  // executeSwap throws a meaningful message. If even that's missing (no
+  // executable AND no blocking error), there is nothing signable here and
+  // the caller should treat it as a routing failure.
+  const informative = quotes.filter((q) => q.blocking != null);
+  if (!informative.length) return null;
+  return informative.reduce((best, q) => (out(q) > out(best) ? q : best));
+}
+
+function noRouteError(amount, fromResolved, toResolved, fromChain) {
+  const err = new Error(
+    `No swap route found for ${amount} ${fromResolved.symbol} → ${toResolved.symbol} on ${fromChain}. ` +
+    `Minimum swap is ~$1. ` +
+    `Check your balance and chain with: zerion portfolio`
+  );
+  err.code = "no_route";
+  err.suggestion = `Try a smaller amount or different pair: zerion swap ${fromChain} 0.001 ETH USDC`;
+  return err;
+}
+
+/**
+ * Get a single swap/bridge quote, picked by strategy ("cheapest" | "fast").
+ * "cheapest" is the legacy default — matches the API's first-offer ordering
+ * and never changes behavior for existing callers.
+ */
+export async function getSwapQuote(input) {
+  const strategy = input.strategy || "cheapest";
+  const { params, fromResolved, toResolved } = await buildQuoteRequest(input);
+  const response = await api.getSwapQuotes(params);
+  const offers = response.data || [];
+
+  if (offers.length === 0) {
+    throw noRouteError(input.amount, fromResolved, toResolved, input.fromChain);
+  }
+
+  const picked = selectOffer(offers, strategy);
+  return offerToQuote(picked, {
+    fromResolved,
+    toResolved,
+    fromChain: input.fromChain,
+    toChain: input.toChain,
+    amount: input.amount,
+    walletAddress: input.walletAddress,
+    outputReceiver: input.outputReceiver,
+  });
+}
+
+/**
+ * List ALL swap/bridge offers without picking one. Used by `zerion bridge`
+ * (no flag) so the agent can compare providers before committing.
+ */
+export async function getSwapOffers(input) {
+  const { params, fromResolved, toResolved } = await buildQuoteRequest(input);
+  const response = await api.getSwapQuotes(params);
+  const offers = response.data || [];
+
+  if (offers.length === 0) {
+    throw noRouteError(input.amount, fromResolved, toResolved, input.fromChain);
+  }
+
+  return offers.map((o) => offerToQuote(o, {
+    fromResolved,
+    toResolved,
+    fromChain: input.fromChain,
+    toChain: input.toChain,
+    amount: input.amount,
+    walletAddress: input.walletAddress,
+    outputReceiver: input.outputReceiver,
+  }));
+}
+
 /**
  * Execute a swap — sign approval (if any), sign swap, broadcast.
  * @param {object} quote
@@ -173,8 +368,13 @@ export async function getSwapQuote({
  * @param {string} passphrase
  * @param {object} [options]
  * @param {number} [options.timeout] - broadcast timeout in seconds
+ * @param {number} [options.approvalNonceOverride] - force the approval tx's
+ *   nonce instead of trusting RPC `latest`. Used by batch flows (e.g.
+ *   `zerion consolidate --execute`) where successive swaps share a wallet
+ *   and the RPC's `latest` nonce can lag the previous swap's submission.
+ *   Ignored on Solana (no nonce concept) and when no approval is needed.
  */
-export async function executeSwap(quote, walletName, passphrase, { timeout } = {}) {
+export async function executeSwap(quote, walletName, passphrase, { timeout, approvalNonceOverride } = {}) {
   if (quote.blocking) {
     const err = new Error(
       `Quote not executable: ${quote.blocking.message || quote.blocking.code}` +
@@ -191,6 +391,9 @@ export async function executeSwap(quote, walletName, passphrase, { timeout } = {
     if (!quote.transactionSwapSolana?.raw) {
       throw new Error("Quote did not include a Solana transaction");
     }
+    // Solana has no EVM-style nonce — approvalNonceOverride is irrelevant
+    // here. Forward it anyway in case future Solana flows want to thread
+    // their own equivalent; the executor ignores it.
     return executeSolanaSwap(quote, walletName, passphrase);
   }
 
@@ -198,7 +401,143 @@ export async function executeSwap(quote, walletName, passphrase, { timeout } = {
     throw new Error("Quote did not include an EVM transaction");
   }
 
-  return executeEvmSwap(quote, walletName, passphrase, zerionChainId, { timeout, isCrossChain });
+  return executeEvmSwap(quote, walletName, passphrase, zerionChainId, {
+    timeout,
+    isCrossChain,
+    approvalNonceOverride,
+  });
+}
+
+/**
+ * Build the web-app handoff **group** for a swap/bridge quote — the shared core
+ * of both `executeViaWebApp` (direct single-command handoff) and the `--prepare`
+ * path (nonce-free prepared group). Runs the API blocking gate, the allowance
+ * skip, and `enforceExecutablePolicies` per tx; returns the fully-formed group
+ * plus the metadata a prepared-group envelope needs.
+ *
+ * @param {object} quote
+ * @param {object} options
+ * @param {string} options.address - the CLI's resolved signer address
+ * @param {boolean} [options.isBridge] - label the swap tx as a bridge
+ * @param {boolean} [options.assignNonces=true] - assign sequential pending
+ *   nonces (direct handoff). Pass `false` for a nonce-free prepared group / bundle
+ *   (the web app assigns nonces; ADR-0003).
+ * @returns {Promise<{ ecosystem:"evm"|"solana", chain:string, from:string,
+ *   transactions:Array, client:object, outflows:Array }>}
+ */
+export async function buildSwapWebAppGroup(quote, { address, isBridge = false, assignNonces = true } = {}) {
+  // API blocking gate — runs on the handoff route too, before a link is formed.
+  if (quote.blocking) {
+    const err = new Error(
+      `Quote not executable: ${quote.blocking.message || quote.blocking.code}` +
+      (quote.blocking.hint ? ` (hint: ${quote.blocking.hint})` : "")
+    );
+    err.code = quote.blocking.code || "quote_blocked";
+    throw err;
+  }
+
+  const zerionChainId = quote.fromChain;
+  const label = `${isBridge ? "Bridge" : "Swap"} ${quote.from.symbol} → ${quote.to.symbol}`;
+  const outflows = [{
+    fungibleId: quote.from.fungibleId,
+    chain: zerionChainId,
+    symbol: quote.from.symbol,
+    amount: quote.inputAmount,
+    tokenAddress: quote.from.address || null,
+  }];
+
+  // Solana: hand off the API's unsigned base64 tx. The connected wallet signs
+  // and broadcasts; we verify the returned signature on-chain via the Solana
+  // receipt adapter. Policy enforcement mirrors the local Solana path
+  // (executeSolanaSwap), which does not decode the opaque raw tx to to/value/data.
+  if (isSolana(zerionChainId)) {
+    const raw = quote.transactionSwapSolana?.raw;
+    if (!raw) {
+      throw new Error("Quote did not include a Solana transaction");
+    }
+    const from = quote.transactionSwapSolana.from || address;
+    const transactions = [{ solana: toSolanaTransaction(raw), label }];
+    return { ecosystem: "solana", chain: zerionChainId, from, transactions, client: solanaReceiptAdapter(), outflows };
+  }
+
+  if (!quote.transactionSwap) {
+    throw new Error("Quote did not include an EVM transaction");
+  }
+
+  const client = await getPublicClient(zerionChainId);
+  const chainIdNum = client.chain.id;
+  const from = quote.transactionSwap.from || address;
+
+  // One pending-nonce read for the whole group, assigned sequentially — only on
+  // the direct-handoff path. Prepared groups / bundles stay nonce-free.
+  let nonce = assignNonces
+    ? await client.getTransactionCount({ address: from, blockTag: "pending" })
+    : null;
+
+  const transactions = [];
+
+  // Approval — include only if the on-chain allowance is insufficient.
+  if (quote.transactionApprove) {
+    const approveTx = quote.transactionApprove;
+    const alreadyApproved = await hasSufficientAllowance({
+      zerionChainId,
+      approveTx,
+      owner: approveTx.from,
+    });
+    if (alreadyApproved) {
+      process.stderr.write(`Existing allowance covers this swap — skipping approval.\n`);
+    } else {
+      // Policy pre-filter — runs on the handoff route too, before the link forms.
+      await enforceExecutablePolicies({
+        to: approveTx.to,
+        value: approveTx.value || "0",
+        data: approveTx.data,
+        chain: zerionChainId,
+      });
+      transactions.push({
+        evm: toTransactionEVM(approveTx, { chainIdNum, from, nonce: nonce ?? undefined }),
+        label: `Approve ${quote.from.symbol}`,
+      });
+      if (nonce != null) nonce += 1;
+    }
+  }
+
+  const swapTx = quote.transactionSwap;
+  await enforceExecutablePolicies({
+    to: swapTx.to,
+    value: swapTx.value || "0",
+    data: swapTx.data,
+    chain: zerionChainId,
+  });
+  transactions.push({
+    evm: toTransactionEVM(swapTx, { chainIdNum, from, nonce: nonce ?? undefined }),
+    label,
+  });
+
+  return { ecosystem: "evm", chain: zerionChainId, from, transactions, client, chainIdNum, outflows };
+}
+
+/**
+ * Web-app handoff variant of executeSwap — builds a fully-formed EVM bundle
+ * (optional approve + swap) and hands it to the Zerion web app for signing
+ * instead of signing/broadcasting locally. Same allowance-skip behavior as
+ * executeSwap; drops broadcast, receipt wait, and bridge-delivery polling
+ * (the connected wallet + web app own those now).
+ *
+ * @param {object} quote
+ * @param {object} options
+ * @param {string} options.address - the CLI's resolved signer address
+ * @param {number} [options.timeout] - callback wait timeout in seconds
+ * @param {boolean} [options.isBridge] - label the swap tx as a bridge
+ * @returns {Promise<object>} the signViaWebApp result ({ status, hashes?, ... })
+ */
+export async function executeViaWebApp(quote, { address, timeout, isBridge = false } = {}) {
+  const { from, transactions, client } = await buildSwapWebAppGroup(quote, {
+    address,
+    isBridge,
+    assignNonces: true,
+  });
+  return signViaWebApp({ address: from, transactions, timeout, client });
 }
 
 async function executeSolanaSwap(quote, walletName, passphrase) {
@@ -220,7 +559,7 @@ async function executeSolanaSwap(quote, walletName, passphrase) {
   };
 }
 
-async function executeEvmSwap(quote, walletName, passphrase, zerionChainId, { timeout, isCrossChain = false } = {}) {
+async function executeEvmSwap(quote, walletName, passphrase, zerionChainId, { timeout, isCrossChain = false, approvalNonceOverride } = {}) {
   // Snapshot destination balance before bridge (for delivery detection)
   let preBalance = null;
   if (isCrossChain) {
@@ -252,11 +591,17 @@ async function executeEvmSwap(quote, walletName, passphrase, zerionChainId, { ti
       });
 
       process.stderr.write(`Approving ${quote.from.symbol} for swap...\n`);
+      // Honour an external nonce hint when the caller knows where the wallet's
+      // pending queue should be (batch flows that don't trust RPC `latest`
+      // between back-to-back swaps). With no override we fall through to the
+      // signer's default (read `latest` from RPC), preserving the one-shot
+      // swap/bridge contract.
       const { signedTxHex, client, tx: signedApprove } = await signSwapTransaction(
         approveTx,
         zerionChainId,
         walletName,
-        passphrase
+        passphrase,
+        approvalNonceOverride != null ? { nonceOverride: approvalNonceOverride } : undefined,
       );
       approvalNonce = signedApprove.nonce;
       const approvalResult = await broadcastAndWait(client, signedTxHex, { timeout });
@@ -284,7 +629,13 @@ async function executeEvmSwap(quote, walletName, passphrase, zerionChainId, { ti
     data: swapTx.data,
   });
 
-  const swapNonceOverride = approvalNonce != null ? approvalNonce + 1 : undefined;
+  // When approval is needed, the swap's nonce is approvalNonce + 1. When the
+  // allowance already covers the swap (no approval tx), the swap consumes the
+  // same nonce the batch reserved for the approval — fall through to the
+  // caller's override directly so back-to-back allowance-covered rows don't
+  // race RPC `latest`.
+  const swapNonceOverride =
+    approvalNonce != null ? approvalNonce + 1 : approvalNonceOverride;
   const { signedTxHex, client } = await signSwapTransaction(
     swapTx,
     zerionChainId,

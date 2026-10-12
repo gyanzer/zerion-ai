@@ -116,10 +116,24 @@ export async function enforceExecutablePolicies(txInfo) {
     for (const script of scripts) {
       const resolved = resolve(script);
       if (!resolved.startsWith(POLICIES_DIR)) {
-        printError("policy_path_violation", `Policy script outside allowed directory: ${script}`, {
-          policy: policy.name || pid,
-        });
-        process.exit(1);
+        // Debug-only escape hatch: allow running a policy script from outside
+        // the trusted policies directory. Env-var only (never persisted), and
+        // loud on every run so it can't be left on by accident in production.
+        if (process.env.ZERION_UNSAFE_POLICY_PATHS === "1") {
+          process.stderr.write(
+            `\n⚠️  ZERION_UNSAFE_POLICY_PATHS=1 — skipping the policy-script path check.\n` +
+            `   Running "${script}" from OUTSIDE the trusted policies directory.\n` +
+            `   Debug only. Never set this in production.\n\n`
+          );
+        } else {
+          printError("policy_path_violation", `Policy script outside allowed directory: ${script}`, {
+            policy: policy.name || pid,
+            suggestion:
+              "Move the script under the CLI's policies/ directory, or set " +
+              "ZERION_UNSAFE_POLICY_PATHS=1 to bypass this check while debugging.",
+          });
+          process.exit(1);
+        }
       }
       try {
         const mod = await import(pathToFileURL(resolved).href);
@@ -154,6 +168,45 @@ export function parseTimeout(value) {
   if (isNaN(n) || n <= 0) {
     printError("invalid_timeout", `Invalid timeout: ${value}`, {
       suggestion: "Timeout must be a positive number of seconds, e.g. --timeout 120",
+    });
+    process.exit(1);
+  }
+  return n;
+}
+
+/**
+ * Parse and validate a --slippage flag value (percent, 0-100). Returns
+ * undefined when the flag is absent so callers can fall back to defaults
+ * (config or DEFAULT_SLIPPAGE). Rejects negative, NaN, and >100 values that
+ * would otherwise sail through `parseFloat` and reach the swap API.
+ * @param {string|boolean|undefined} value - raw flag value
+ * @returns {number|undefined}
+ */
+export function parseSlippage(value) {
+  if (value === undefined || value === false) return undefined;
+  // `--slippage` with no following value parses as `true`. Treat it the same
+  // as a malformed value — reject rather than silently coerce to NaN.
+  if (typeof value !== "string" && typeof value !== "number") {
+    printError("invalid_slippage", `Invalid slippage: ${value}`, {
+      suggestion: "Slippage must be a number 0–100, e.g. --slippage 2",
+    });
+    process.exit(1);
+  }
+  // `parseFloat` would accept "2abc" as 2 — silently passing a malformed
+  // value through to the swap API. `Number()` rejects partial-numeric
+  // strings (returns NaN), which is what we want for a strict CLI flag.
+  // Trim whitespace first so " 2 " is still accepted, and reject the
+  // post-trim empty case (Number("") returns 0, which would slip through).
+  let n;
+  if (typeof value === "number") {
+    n = value;
+  } else {
+    const trimmed = String(value).trim();
+    n = trimmed === "" ? NaN : Number(trimmed);
+  }
+  if (!Number.isFinite(n) || n < 0 || n > 100) {
+    printError("invalid_slippage", `Invalid slippage: ${value}`, {
+      suggestion: "Slippage must be a number between 0 and 100 (percent), e.g. --slippage 2",
     });
     process.exit(1);
   }

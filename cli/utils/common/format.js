@@ -19,9 +19,27 @@ function padStart(str, len) {
   return String(str).padStart(len);
 }
 
+// Truncate-then-pad. Use for table cells where overflow would push
+// neighboring columns out of alignment (e.g. liquidity-source provider names
+// like "stargate-v2-relayer" that exceed the column width).
+function padTrunc(str, len) {
+  const s = String(str);
+  if (s.length <= len) return s.padEnd(len);
+  // Reserve one char for the ellipsis so truncation is visible.
+  return s.slice(0, len - 1).padEnd(len, "…");
+}
+
 function usd(value) {
   if (value == null) return "-";
   return `$${Number(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// A signed dollar delta (e.g. a 24h change), coloured like a percentage.
+function usdDelta(value) {
+  if (value == null) return "-";
+  const n = Number(value);
+  const color = n >= 0 ? GREEN : RED;
+  return `${color}${n >= 0 ? "+" : "-"}${usd(Math.abs(n))}${RESET}`;
 }
 
 function pct(value) {
@@ -87,18 +105,44 @@ export function formatSearch(data) {
   return lines.join("\n");
 }
 
+// Structured `notes` (e.g. the Solana "token holdings only" downgrade) exist to
+// explain a result that would otherwise look wrong. JSON consumers read them off
+// the payload; pretty mode has to print them or humans — the ones likely to ask
+// where their DeFi went — never see them.
+function noteLines(data) {
+  const notes = data.notes ?? [];
+  if (!notes.length) return [];
+  return [...notes.map((n) => `  ${DIM}ⓘ ${n}${RESET}`), ""];
+}
+
 export function formatPortfolio(data) {
+  const scope = data.chain ? ` ${DIM}· ${data.chain}${RESET}` : "";
   const lines = [
-    `${BOLD}Portfolio${RESET} — ${data.wallet.name} ${DIM}(${data.wallet.address.slice(0, 8)}...)${RESET}\n`,
-    `  Total: ${BOLD}${usd(data.portfolio.total)}${RESET}  24h: ${pct(data.portfolio.change_24h)}\n`,
+    `${BOLD}Portfolio${RESET} — ${data.wallet.name} ${DIM}(${data.wallet.address.slice(0, 8)}...)${RESET}${scope}\n`,
+    // change_24h is `changes.absolute_1d` — dollars, not a percentage. It was
+    // being rendered through pct(), which printed a $4,048 move as "-4048.26%".
+    `  Total: ${BOLD}${usd(data.portfolio.total)}${RESET}  24h: ${usdDelta(data.portfolio.change_24h)}\n`,
+    ...noteLines(data),
   ];
 
   if (data.positions.length > 0) {
-    lines.push(`  ${DIM}${pad("Token", 16)} ${pad("Chain", 12)} ${padStart("Value", 12)} ${padStart("Amount", 16)}${RESET}`);
-    lines.push(`  ${DIM}${"─".repeat(58)}${RESET}`);
+    // The total includes DeFi, so the list does too — label the protocol rows,
+    // or a staked ETH row is indistinguishable from the wallet ETH row above it.
+    const hasDefi = data.positions.some((p) => p.position_type && p.position_type !== "wallet");
+    const typeHeader = hasDefi ? ` ${pad("Type", 10)} Protocol` : "";
+    lines.push(`  ${DIM}${pad("Token", 16)} ${pad("Chain", 12)} ${padStart("Value", 12)} ${padStart("Amount", 16)}${typeHeader}${RESET}`);
+    lines.push(`  ${DIM}${"─".repeat(hasDefi ? 80 : 58)}${RESET}`);
     for (const p of data.positions) {
+      // A plain holding gets blanks, not a "[—]" badge: the column exists to
+      // mark the protocol rows, and most rows are ordinary token balances.
+      const isProtocolRow = p.position_type && p.position_type !== "wallet";
+      const typeCol = !hasDefi
+        ? ""
+        : isProtocolRow
+          ? ` ${positionTypeBadge(p.position_type)} ${p.protocol || ""}`.trimEnd()
+          : ` ${pad("", 10)}`;
       lines.push(
-        `  ${pad(p.symbol || "?", 16)} ${pad(p.chain || "?", 12)} ${padStart(usd(p.value), 12)} ${padStart(p.quantity?.toFixed(4) || "-", 16)}`
+        `  ${pad(p.symbol || "?", 16)} ${pad(p.chain || "?", 12)} ${padStart(usd(p.value), 12)} ${padStart(p.quantity?.toFixed(4) || "-", 16)}${typeCol}`
       );
     }
   }
@@ -109,6 +153,7 @@ export function formatPositions(data) {
   const walletLabel = data.wallet.name || data.wallet.address.slice(0, 10) + "...";
   const lines = [
     `${BOLD}Positions${RESET} — ${walletLabel} (${data.count})\n`,
+    ...noteLines(data),
     `  ${DIM}${pad("Token", 16)} ${pad("Chain", 12)} ${padStart("Value", 12)} ${padStart("24h", 18)} ${padStart("Amount", 16)}${RESET}`,
     `  ${DIM}${"─".repeat(76)}${RESET}`,
   ];
@@ -119,6 +164,65 @@ export function formatPositions(data) {
     );
   }
   return lines.join("\n");
+}
+
+// Color tags per position_type. Picks reflect financial polarity:
+// loan = debt (red), reward = pending income (yellow), locked = illiquid (cyan),
+// deposit/staked = active asset (green). wallet/investment fall through to dim.
+const POSITION_TYPE_COLOR = {
+  deposit: GREEN,
+  staked: GREEN,
+  loan: RED,
+  reward: YELLOW,
+  locked: CYAN,
+};
+
+function positionTypeBadge(type) {
+  const color = POSITION_TYPE_COLOR[type] || DIM;
+  const label = (type || "—").padEnd(8);
+  return `${color}[${label}]${RESET}`;
+}
+
+// Format a position value with loan-aware sign + color. Loans display as
+// negative because their value represents outstanding debt, not asset value.
+function signedUsd(value, positionType) {
+  if (positionType === "loan") return `${RED}-${usd(value)}${RESET}`;
+  return usd(value);
+}
+
+export function formatDefiPositions(data) {
+  const walletLabel = data.wallet.name || data.wallet.address.slice(0, 10) + "...";
+  const { protocols, positions } = data.summary;
+  const lines = [
+    `${BOLD}DeFi Positions${RESET} — ${walletLabel}  ${DIM}(${protocols} protocols · ${positions} positions · net ${usd(data.summary.total_value)})${RESET}\n`,
+  ];
+
+  if (!data.protocols.length) {
+    lines.push(`  ${DIM}(no DeFi positions found)${RESET}`);
+    return lines.join("\n");
+  }
+
+  for (const proto of data.protocols) {
+    const moduleLabel = proto.module ? ` ${DIM}[${proto.module}]${RESET}` : "";
+    lines.push(`${BOLD}${proto.dapp}${RESET}${moduleLabel}  ${DIM}net${RESET} ${BOLD}${usd(proto.net_value)}${RESET}`);
+    lines.push(`  ${DIM}${"─".repeat(72)}${RESET}`);
+    for (const g of proto.groups) {
+      const isPool = g.tokens.length > 1 && g.group_id;
+      if (isPool) {
+        lines.push(`  ${DIM}Pool ${g.group_id.slice(0, 10)}…${RESET}  ${padStart(usd(g.value), 14)}`);
+        for (const t of g.tokens) lines.push(renderDefiRow(t, true));
+      } else {
+        for (const t of g.tokens) lines.push(renderDefiRow(t, false));
+      }
+    }
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd();
+}
+
+function renderDefiRow(t, indented) {
+  const indent = indented ? "      " : "    ";
+  return `${indent}${positionTypeBadge(t.position_type)} ${pad(t.symbol || "?", 10)} ${pad(t.chain || "?", 12)} ${padStart(t.quantity != null ? Number(t.quantity).toFixed(4) : "-", 14)} ${padStart(signedUsd(t.value, t.position_type), 18)}`;
 }
 
 function formatChange(position) {
@@ -174,6 +278,172 @@ export function formatSwapQuote(data) {
   return lines.join("\n");
 }
 
+export function formatBridgeOffers(data) {
+  // Column widths chosen to fit comfortably in 80-col terminals. Provider
+  // gets truncated (longest known: ~20 chars); numeric columns padStart so
+  // alignment holds even when values vary in length.
+  const W = { idx: 3, provider: 18, output: 14, time: 8, fee: 8, status: 10 };
+  const totalWidth = Object.values(W).reduce((a, b) => a + b, 0) + Object.keys(W).length - 1;
+
+  const lines = [
+    `${BOLD}Bridge Quotes${RESET} — ${data.fromChain} → ${data.toChain}  ${DIM}(${data.amount} ${data.fromToken} → ${data.toToken})${RESET}\n`,
+  ];
+  lines.push(`  ${DIM}${pad("#", W.idx)} ${pad("Provider", W.provider)} ${padStart("Output", W.output)} ${padStart("Time", W.time)} ${padStart("Fee %", W.fee)} ${pad("Status", W.status)}${RESET}`);
+  lines.push(`  ${DIM}${"─".repeat(totalWidth)}${RESET}`);
+  if (data.offers.length === 0) {
+    lines.push(`  ${DIM}(no offers)${RESET}`);
+  }
+  for (const [i, o] of data.offers.entries()) {
+    const time = o.estimatedSeconds != null ? `${o.estimatedSeconds}s` : "-";
+    const fee = o.fee?.protocolPercent != null ? `${Number(o.fee.protocolPercent).toFixed(2)}%` : "-";
+    const out = o.estimatedOutput ?? "-";
+    const provider = o.provider || o.liquiditySource || "(unknown)";
+    // Blocked offers stay in the table so users see the full route set, but
+    // we mark them clearly — pickOffer will skip these in favor of any
+    // executable offer, so the visual ordering ("biggest output wins") would
+    // otherwise mislead about what `--cheapest` actually selects.
+    const blocked = o.executable === false || o.blocking != null;
+    const status = blocked
+      ? `${RED}blocked${RESET}`
+      : `${GREEN}ready${RESET}`;
+    const row = `  ${pad(i + 1, W.idx)} ${padTrunc(provider, W.provider)} ${padStart(out, W.output)} ${padStart(time, W.time)} ${padStart(fee, W.fee)} ${status}`;
+    lines.push(blocked ? `${DIM}${row}${RESET}` : row);
+  }
+  lines.push("");
+  lines.push(`  ${YELLOW}Pick one:${RESET} re-run with ${BOLD}--cheapest${RESET} (highest output) or ${BOLD}--fast${RESET} (lowest time). Blocked offers are skipped automatically.`);
+  return lines.join("\n");
+}
+
+function formatStatusCell(row) {
+  // Colour-coded status cell with reason annotation. `ready` is green;
+  // `blocked` / `no_route` are red; `skipped` is dim so dust/no-price rows
+  // recede visually.
+  if (row.status === "ready") return `${GREEN}ready${RESET}`;
+  if (row.status === "blocked") return `${RED}blocked${RESET}${row.reason ? ` ${DIM}(${row.reason})${RESET}` : ""}`;
+  if (row.status === "no_route") return `${RED}no_route${RESET}`;
+  return `${DIM}skipped${row.reason ? ` (${row.reason})` : ""}${RESET}`;
+}
+
+function lossCell(value) {
+  if (value == null) return "-";
+  // Loss is reported as a fraction (0.05 = 5% loss). Loss positive → red.
+  // Gain (negative loss) → green, displayed with a `+` prefix and the
+  // absolute magnitude so it reads as `+2.50%` rather than `+-2.50%`.
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "-";
+  const pctValue = n * 100;
+  const color = pctValue > 0 ? RED : GREEN;
+  const sign = pctValue >= 0 ? "" : "+";
+  return `${color}${sign}${Math.abs(pctValue).toFixed(2)}%${RESET}`;
+}
+
+export function formatConsolidatePlan(data) {
+  // Column widths sized for 80-col terminals. Symbol fits common tickers;
+  // Output gets a wider column because target-token decimals can grow long.
+  const W = { idx: 3, symbol: 10, qty: 14, value: 12, output: 16, loss: 10, status: 22 };
+  const totalWidth = Object.values(W).reduce((a, b) => a + b, 0) + Object.keys(W).length - 1;
+  const rows = data.rows || [];
+
+  const lines = [
+    `${BOLD}Consolidate Plan${RESET} — ${data.chain} → ${data.toToken}` +
+      (data.walletAddress ? `  ${DIM}(${data.walletAddress.slice(0, 8)}…)${RESET}` : "") +
+      "\n",
+  ];
+  if (Number.isFinite(data.concurrency)) {
+    // Surface the tier + provenance ("auto" vs "flag") so it's obvious why
+    // the planner picked a particular concurrency without having to read the
+    // JSON body — important when a dev key silently caps the user's
+    // expectation.
+    const tier = data.apiKeyTier ? `${data.apiKeyTier} key` : "unknown key";
+    const src = data.concurrencySource === "flag" ? "--concurrency" : "auto";
+    lines.push(`  ${DIM}Concurrency:${RESET} ${data.concurrency} ${DIM}(${tier}, ${src})${RESET}\n`);
+  }
+  lines.push(
+    `  ${DIM}${pad("#", W.idx)} ${pad("Symbol", W.symbol)} ${padStart("Qty", W.qty)} ${padStart("Value (USD)", W.value)} ${padStart("Output", W.output)} ${padStart("Loss %", W.loss)} ${pad("Status", W.status)}${RESET}`,
+  );
+  lines.push(`  ${DIM}${"─".repeat(totalWidth)}${RESET}`);
+
+  if (rows.length === 0) {
+    lines.push(`  ${DIM}(no candidate positions)${RESET}`);
+  }
+
+  for (const [i, r] of rows.entries()) {
+    const qty = Number.isFinite(r.quantity) ? Number(r.quantity).toFixed(6) : "-";
+    const value = Number.isFinite(r.value_usd) ? usd(r.value_usd) : "-";
+    const out = Number.isFinite(r.expected_output) ? Number(r.expected_output).toFixed(6) : "-";
+    const loss = lossCell(r.loss_pct);
+    const status = formatStatusCell(r);
+    const row = `  ${pad(i + 1, W.idx)} ${pad(r.symbol || "?", W.symbol)} ${padStart(qty, W.qty)} ${padStart(value, W.value)} ${padStart(out, W.output)} ${padStart(loss, W.loss + 9)} ${status}`;
+    if (r.status === "ready") lines.push(row);
+    else lines.push(`${DIM}${row}${RESET}`);
+  }
+
+  const t = data.totals || {};
+  const expectedUsd = t.expected_output_usd != null ? ` (~${usd(t.expected_output_usd)})` : "";
+  lines.push("");
+  lines.push(
+    `  ${BOLD}${t.ready || 0} ready${RESET}, ${t.blocked || 0} blocked, ${t.skipped || 0} skipped` +
+      (t.no_route ? `, ${t.no_route} no_route` : "") +
+      ` — expected ~${Number(t.expected_output || 0).toFixed(6)} ${data.toToken}${expectedUsd}`,
+  );
+  if (!data.executed) {
+    lines.push(
+      `  ${YELLOW}Re-run with ${BOLD}--execute${RESET}${YELLOW} to broadcast the ready rows.${RESET}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+export function formatConsolidateResult(data) {
+  const W = { idx: 3, symbol: 10, hash: 18, status: 12, error: 28 };
+  const totalWidth = Object.values(W).reduce((a, b) => a + b, 0) + Object.keys(W).length - 1;
+  const results = data.results || [];
+  const summary = data.summary || {};
+
+  const lines = [
+    `${BOLD}Consolidate Result${RESET} — ${data.chain || "?"} → ${data.toToken || "?"}` +
+      (data.walletAddress ? `  ${DIM}(${data.walletAddress.slice(0, 8)}…)${RESET}` : "") +
+      "\n",
+  ];
+  lines.push(
+    `  ${DIM}${pad("#", W.idx)} ${pad("Symbol", W.symbol)} ${pad("Hash", W.hash)} ${pad("Status", W.status)} ${pad("Error", W.error)}${RESET}`,
+  );
+  lines.push(`  ${DIM}${"─".repeat(totalWidth)}${RESET}`);
+  if (results.length === 0) {
+    lines.push(`  ${DIM}(no swaps executed)${RESET}`);
+  }
+  for (const [i, r] of results.entries()) {
+    const hash = r.hash ? `${r.hash.slice(0, 10)}…${r.hash.slice(-4)}` : "-";
+    const ok = r.status === "success";
+    const status = ok ? `${GREEN}success${RESET}` : `${RED}${r.status || "failed"}${RESET}`;
+    const err = r.error ? padTrunc(r.error, W.error) : pad("-", W.error);
+    lines.push(`  ${pad(i + 1, W.idx)} ${pad(r.symbol, W.symbol)} ${pad(hash, W.hash)} ${pad(status, W.status + 9)} ${err}`);
+  }
+  lines.push("");
+  lines.push(
+    `  ${BOLD}${summary.succeeded || 0} succeeded${RESET}, ${summary.failed || 0} failed`,
+  );
+
+  // The table's Error column truncates at ~27 chars, which buries the actual
+  // reason for any failure ("Quote not executable: Input asset balance is not
+  // enough…" gets clipped to "Quote not executable: Input…"). Print the full
+  // error string per failed row below the summary so operators can act on it
+  // without re-running with --verbose or scraping JSON.
+  if ((summary.failed || 0) > 0) {
+    const failures = results.filter((r) => r.status !== "success");
+    if (failures.length > 0) {
+      lines.push("");
+      lines.push(`  ${RED}Failures:${RESET}`);
+      for (const r of failures) {
+        const msg = r.error || r.status || "(no error message)";
+        lines.push(`    ${r.symbol}: ${msg}`);
+      }
+    }
+  }
+
+  return lines.join("\n");
+}
+
 export function formatHistory(data) {
   const lines = [`${BOLD}Transactions${RESET} — ${data.wallet.name} (${data.count})\n`];
   for (const tx of data.transactions) {
@@ -189,13 +459,13 @@ export function formatHistory(data) {
 
 export function formatChains(data) {
   const lines = [`${BOLD}Supported Chains${RESET} (${data.count})\n`];
-  lines.push(`  ${DIM}${pad("ID", 22)} ${pad("Name", 20)} ${pad("Trade", 6)} ${pad("Bridge", 7)} ${"Send"}${RESET}`);
-  lines.push(`  ${DIM}${"─".repeat(64)}${RESET}`);
+  lines.push(`  ${DIM}${pad("ID", 22)} ${pad("Name", 20)} ${pad("Chain ID", 11)} ${pad("Trade", 6)} ${pad("Bridge", 7)} ${"Send"}${RESET}`);
+  lines.push(`  ${DIM}${"─".repeat(76)}${RESET}`);
   for (const c of data.chains) {
     const t = c.supportsTrading ? "✓" : " ";
     const b = c.supportsBridge ? "✓" : " ";
     const s = c.supportsSending ? "✓" : " ";
-    lines.push(`  ${pad(c.id, 22)} ${pad(c.name, 20)} ${pad(t, 6)} ${pad(b, 7)} ${s}`);
+    lines.push(`  ${pad(c.id, 22)} ${pad(c.name, 20)} ${pad(c.chainId == null ? "-" : String(c.chainId), 11)} ${pad(t, 6)} ${pad(b, 7)} ${s}`);
   }
   return lines.join("\n");
 }

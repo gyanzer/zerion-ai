@@ -4,14 +4,19 @@ import { requireAgentToken, parseTimeout, handleTradingError, enforceExecutableP
 import * as api from "../../utils/api/client.js";
 import { getPublicClient, broadcastAndWait, signAndSerialize } from "../../utils/trading/transaction.js";
 import { resolveWallet } from "../../utils/wallet/resolve.js";
+import { toTransactionEVM, toSolanaTransaction, signViaWebApp, reportHandoff } from "../../utils/web-app/handoff.js";
+import { buildPreparedGroup, printPreparedGroup } from "../../utils/web-app/prepared-group.js";
+import { decideSigningRoute } from "../../utils/trading/signing-route.js";
+import { bundleSellUsd } from "../../utils/trading/valuation.js";
+import { estimateGasWithFallback, NATIVE_TRANSFER_GAS, ERC20_TRANSFER_GAS } from "../../utils/trading/gas.js";
 import { print, printError } from "../../utils/common/output.js";
 import { getConfigValue } from "../../utils/config.js";
-import { getEvmAddress } from "../../utils/wallet/keystore.js";
 import { NATIVE_ASSET_ADDRESS } from "../../utils/common/constants.js";
 import { formatSwapQuote } from "../../utils/common/format.js";
 import { validateTradingChainAsync } from "../../utils/common/validate.js";
 import { isSolana } from "../../utils/chain/registry.js";
 import { sendSolanaNative } from "../../utils/chain/solana-send.js";
+import { buildUnsignedSolanaTransfer, solanaReceiptAdapter } from "../../utils/chain/solana-handoff.js";
 
 const ERC20_TRANSFER_ABI = parseAbi([
   "function transfer(address to, uint256 amount) returns (bool)",
@@ -114,20 +119,36 @@ export default async function send(args, flags) {
       },
     };
 
-    // Agent token required — no interactive passphrase for trading
-    const passphrase = await requireAgentToken("for trading", walletName);
-
     const client = await getPublicClient(chain);
-    const walletAddress = getEvmAddress(walletName);
+    // resolveWallet already returned the wallet's EVM address; use it directly
+    // so read-only wallets (no keystore entry) resolve too.
+    const walletAddress = address;
 
     const [nonce, feeData] = await Promise.all([
       client.getTransactionCount({ address: walletAddress, blockTag: "pending" }),
       client.estimateFeesPerGas(),
     ]);
 
-    // Balance check: prevent broadcasting doomed transactions (include gas cost for native)
+    // Native gas limit is estimated, never assumed: a flat 21,000 is below the
+    // minimum on Arbitrum-Nitro/Orbit and zkSync-stack chains, which reject it
+    // pre-inclusion as "intrinsic gas too low" (see utils/trading/gas.js).
+    const nativeGas = isNative
+      ? await estimateGasWithFallback({
+          client,
+          account: walletAddress,
+          to,
+          data: "0x",
+          value: amountParsed,
+          fallback: NATIVE_TRANSFER_GAS,
+        })
+      : null;
+
+    // Native balance gate — must cover amount + estimated gas. Runs regardless
+    // of signing route (defense in depth ahead of the human review). Priced off
+    // the same limit the transaction will carry, so the gate can't pass a send
+    // the chain will then refuse to include.
     const balance = await client.getBalance({ address: walletAddress });
-    const estimatedGasCost = 21000n * (feeData.maxFeePerGas || 0n);
+    const estimatedGasCost = (nativeGas ?? NATIVE_TRANSFER_GAS) * (feeData.maxFeePerGas || 0n);
     if (isNative && balance < amountParsed + estimatedGasCost) {
       printError("insufficient_balance",
         `Insufficient ${resolved.symbol}: have ${formatEther(balance)}, need ${amount} + gas (~${formatEther(estimatedGasCost)})`,
@@ -139,6 +160,8 @@ export default async function send(args, flags) {
     const baseTx = {
       type: "eip1559",
       chainId: client.chain.id,
+      // Fees are set for the local sign path; toTransactionEVM drops them for
+      // the web-app handoff (the connected wallet re-estimates at sign time).
       maxFeePerGas: feeData.maxFeePerGas,
       maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
       nonce,
@@ -148,7 +171,7 @@ export default async function send(args, flags) {
 
     let tx;
     if (isNative) {
-      tx = { ...baseTx, to, value: amountParsed, data: "0x", gas: 21000n };
+      tx = { ...baseTx, to, value: amountParsed, data: "0x", gas: nativeGas };
     } else {
       const tokenAddress = resolved.address;
       if (!tokenAddress) {
@@ -158,7 +181,7 @@ export default async function send(args, flags) {
         process.exit(1);
       }
 
-      // ERC-20 balance check before broadcast
+      // ERC-20 balance gate.
       try {
         const tokenBalance = await client.readContract({
           address: tokenAddress,
@@ -183,23 +206,72 @@ export default async function send(args, flags) {
         args: [to, amountParsed],
       });
 
-      const gas = await estimateGasWithFallback(client, walletAddress, tokenAddress, data, 65000n);
+      const gas = await estimateGasWithFallback({
+        client,
+        account: walletAddress,
+        to: tokenAddress,
+        data,
+        fallback: ERC20_TRANSFER_GAS,
+      });
       tx = { ...baseTx, to: tokenAddress, value: 0n, data, gas };
     }
 
-    await enforceExecutablePolicies({ to: tx.to, value: tx.value, data: tx.data });
-    const signedTxHex = await signAndSerialize(tx, chain, walletName, passphrase);
-    const timeout = parseTimeout(flags.timeout);
-    const result = await broadcastAndWait(client, signedTxHex, { timeout });
+    // Policy pre-filter — runs on BOTH signing routes, before a link is formed
+    // or a tx is signed.
+    await enforceExecutablePolicies({ to: tx.to, value: tx.value, data: tx.data, chain });
 
+    const timeout = parseTimeout(flags.timeout);
+
+    // Sell-side USD value drives the routing decision (send = amount × price).
+    const usdValue = await bundleSellUsd({ fungibleId: resolved.fungibleId, amount });
+    const { route, reason } = decideSigningRoute({ walletName, force: flags.review, usdValue });
+    process.stderr.write(`Signing route: ${route} — ${reason}.\n`);
+
+    // --prepare: emit a nonce-free prepared-group envelope instead of executing.
+    // Strip the locally-assigned nonce — the web app / bundle assigns it (ADR-0003).
+    if (flags.prepare) {
+      const { nonce: _omitNonce, ...noNonceTx } = tx;
+      const evm = toTransactionEVM(noNonceTx, { chainIdNum: client.chain.id, from: walletAddress });
+      printPreparedGroup(buildPreparedGroup({
+        ecosystem: "evm",
+        chain,
+        address: walletAddress,
+        walletName,
+        route,
+        summary,
+        transactions: [{ evm, label: `Send ${amount} ${resolved.symbol}` }],
+        outflows: [{
+          fungibleId: resolved.fungibleId,
+          chain,
+          symbol: resolved.symbol,
+          amount,
+          tokenAddress: isNative ? null : resolved.address,
+          native: isNative,
+        }],
+      }));
+      return;
+    }
+
+    if (route === "web-app") {
+      const evm = toTransactionEVM(tx, { chainIdNum: client.chain.id, from: walletAddress });
+      const result = await signViaWebApp({
+        address: walletAddress,
+        transactions: [{ evm, label: `Send ${amount} ${resolved.symbol}` }],
+        timeout,
+        client,
+      });
+      reportHandoff(summary, result);
+      return;
+    }
+
+    // Local route — unlock the keystore, sign, broadcast, wait for receipt.
+    const passphrase = await requireAgentToken("for trading", walletName);
+    const signedTxHex = await signAndSerialize(tx, chain, walletName, passphrase);
+    const result = await broadcastAndWait(client, signedTxHex, { timeout });
     print({
       ...summary,
-      tx: {
-        hash: result.hash,
-        status: result.status,
-        blockNumber: result.blockNumber,
-        gasUsed: result.gasUsed,
-      },
+      signedVia: "local",
+      tx: { hash: result.hash, status: result.status, blockNumber: result.blockNumber, gasUsed: result.gasUsed },
       executed: true,
     }, formatSwapQuote);
   } catch (err) {
@@ -227,7 +299,65 @@ async function sendOnSolana({ token, amount, to, flags }) {
     process.exit(1);
   }
 
+  const summary = {
+    send: {
+      token: "SOL",
+      amount,
+      from: address,
+      to,
+      chain: "solana",
+      type: "native",
+    },
+  };
+
   try {
+    const timeout = parseTimeout(flags.timeout);
+
+    // Sell-side USD value drives routing (send = amount × price(SOL)). Resolve
+    // SOL's fungible id best-effort; if it's unavailable the router fail-closes
+    // to review when a threshold is set.
+    let fungibleId = null;
+    try {
+      fungibleId = (await resolveToken("SOL", "solana")).fungibleId;
+    } catch {
+      // no id → usdValue null → router fail-closes under a threshold
+    }
+    const usdValue = await bundleSellUsd({ fungibleId, amount });
+    const { route, reason } = decideSigningRoute({ walletName, force: flags.review, usdValue });
+    process.stderr.write(`Signing route: ${route} — ${reason}.\n`);
+
+    // --prepare: build the unsigned transfer and emit a prepared-group envelope
+    // (Solana raw txs are already nonce-free — the recent blockhash is baked in).
+    if (flags.prepare) {
+      const { raw } = await buildUnsignedSolanaTransfer({ from: address, to, amountSol: amount });
+      printPreparedGroup(buildPreparedGroup({
+        ecosystem: "solana",
+        chain: "solana",
+        address,
+        walletName,
+        route,
+        summary,
+        transactions: [{ solana: toSolanaTransaction(raw), label: `Send ${amount} SOL` }],
+        outflows: [{ fungibleId, chain: "solana", symbol: "SOL", amount, native: true }],
+      }));
+      return;
+    }
+
+    if (route === "web-app") {
+      // Build the unsigned transfer (balance-gated) and hand it to the web app;
+      // the connected Solana wallet signs and broadcasts.
+      const { raw } = await buildUnsignedSolanaTransfer({ from: address, to, amountSol: amount });
+      const result = await signViaWebApp({
+        address,
+        transactions: [{ solana: toSolanaTransaction(raw), label: `Send ${amount} SOL` }],
+        timeout,
+        client: solanaReceiptAdapter(),
+      });
+      reportHandoff(summary, result);
+      return;
+    }
+
+    // Local route — unlock the keystore, sign, broadcast, confirm.
     const passphrase = await requireAgentToken("for trading", walletName);
     const result = await sendSolanaNative({
       from: address,
@@ -238,14 +368,8 @@ async function sendOnSolana({ token, amount, to, flags }) {
     });
 
     print({
-      send: {
-        token: "SOL",
-        amount,
-        from: address,
-        to,
-        chain: "solana",
-        type: "native",
-      },
+      ...summary,
+      signedVia: "local",
       tx: {
         hash: result.hash,
         status: result.status,
@@ -254,28 +378,5 @@ async function sendOnSolana({ token, amount, to, flags }) {
     });
   } catch (err) {
     handleTradingError(err, "send_error");
-  }
-}
-
-async function estimateGasWithFallback(client, account, to, data, fallback) {
-  try {
-    const estimate = await client.estimateGas({ account, to, data, value: 0n });
-    return (estimate * 120n) / 100n; // 20% buffer
-  } catch (err) {
-    const msg = err.message || "";
-    // If the revert reason indicates the transfer will definitely fail, abort
-    if (msg.includes("exceeds balance") || msg.includes("insufficient") || msg.includes("underflow")) {
-      const error = new Error(
-        `Transfer would fail: ${msg.split("\n")[0]}. Check your token balance.`
-      );
-      error.code = "transfer_would_revert";
-      error.suggestion = "Check your balance with: zerion positions";
-      throw error;
-    }
-    process.stderr.write(
-      `WARNING: Gas estimation failed (${msg.split("\n")[0]}). ` +
-      `Using fallback of ${fallback}. The transaction may revert and you will lose gas fees.\n`
-    );
-    return fallback;
   }
 }

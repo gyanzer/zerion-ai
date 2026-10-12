@@ -20,9 +20,9 @@ weETH is the wrapped, non-rebasing form of ether.fi's eETH. Its value per token 
 - `zerion portfolio <wallet>` — total value and where the ETH sits, per chain
 - `zerion positions <wallet> --chain <chain>` — exact balances on one chain
 - `zerion swap <chain> <amount> ETH weETH` — same-chain ETH → weETH
-- `zerion bridge <from-chain> ETH <amount> <to-chain> weETH` — move ETH from another chain and land as weETH
+- `zerion bridge <from-chain> ETH <amount> <to-chain> weETH --cheapest` — move ETH from another chain and land as weETH
 - `zerion positions <wallet> --positions simple` — confirm the weETH token balance
-- `zerion positions <wallet> --positions defi` — weETH deployed into protocols (lending, LP, ether.fi vaults; match by protocol)
+- `zerion positions <wallet> --positions defi` — weETH deployed into protocols (lending, LP, ether.fi vaults)
 ## Requirements
 - Zerion CLI: `npm install -g zerion-cli`
 - Zerion API key: `export ZERION_API_KEY="zk_..."` (get one at [dashboard.zerion.io](https://dashboard.zerion.io))
@@ -81,17 +81,17 @@ zerion swap base 0.5 ETH 0x04C0599Ae5A44757c0af6F9eC3b93da8976c150A --wallet res
 
 ### 2b. ETH on another chain → bridge into weETH
 
-`zerion bridge` handles bridge + swap in one step, so the ETH arrives as weETH:
+`zerion bridge` handles bridge + swap in one step, so the ETH arrives as weETH. When more than one provider quotes the route, the command lists the quotes and exits without executing, so always pass `--cheapest` (highest output) or `--fast` (lowest time):
 
 ```bash
 # ETH on Optimism → weETH on Arbitrum
-zerion bridge optimism ETH 0.5 arbitrum weETH --wallet restake
+zerion bridge optimism ETH 0.5 arbitrum weETH --wallet restake --cheapest
 
 # ETH on Base → weETH on Ethereum mainnet
-zerion bridge base ETH 0.5 ethereum weETH --wallet restake
+zerion bridge base ETH 0.5 ethereum weETH --wallet restake --cheapest
 ```
 
-Leave ETH on the destination chain for gas if you plan to use the weETH there later.
+The command waits for delivery and reports `Bridge delivery confirmed: +<amount> weETH on <chain>`. Leave ETH on the destination chain for gas if you plan to use the weETH there later.
 
 ### 3. Confirm the position
 
@@ -110,21 +110,24 @@ A plain weETH balance will **not** appear under `--positions defi`. That filter 
 
 ### 4. If the weETH went into an ether.fi vault (e.g. via Zerion Earn)
 
-Vault deposits do show under `--positions defi`, but **match on protocol, not symbol**. The position is valued in the vault's base asset, so weETH deposited into ether.fi Liquid ETH reports as **WETH**, not weETH:
+The weETH leaves the wallet, so it disappears from `--positions simple`. Confirm the deposit through the **vault share token** instead:
 
 ```bash
-zerion positions restake --positions defi --chain ethereum
-# look for: protocol "ether.fi", name "ether.fi Yield: WETH Pool", position_type "deposit"
-
+# The vault's share token lands as a wallet token (e.g. liquidETH for ether.fi Liquid ETH)
 zerion positions restake --positions simple --chain ethereum
-# the vault share token (e.g. liquidETH) sits here as a wallet token
+
+# The deposit itself shows under DeFi, valued in the vault's base asset: WETH, not weETH
+zerion positions restake --positions defi --chain ethereum
 ```
 
-The same deposit can also appear a second time under protocol "Veda" (Veda runs ether.fi's vaults). Count it once when summing DeFi value.
+Two things to know when reading the DeFi list:
+- **It shows WETH, not weETH.** ether.fi Liquid ETH values deposits in WETH. `zerion positions` doesn't output the protocol name, so the matching WETH row can't be told apart from other WETH DeFi positions by name. Pair it with the share token, whose value should be about the same.
+- **The same deposit can be listed twice.** Zerion attributes it to both ether.fi and Veda (Veda runs ether.fi's vaults), so two identical WETH rows appear. Count it once when summing DeFi value.
 
 ## Common Blockers
 - **`--positions defi` is empty after the swap.** Expected: weETH held in the wallet is a token, not a protocol position. Check `--positions simple`.
-- **Vault deposit shows as WETH, not weETH.** ether.fi vault positions are valued in the vault's base asset. Filter by `protocol: ether.fi` instead of the weETH symbol.
+- **Vault deposit shows as WETH, not weETH.** ether.fi vault positions are valued in the vault's base asset. Confirm via the share token (e.g. liquidETH) under `--positions simple`.
+- **Bridge prints quotes but doesn't execute.** Several providers quoted the route. Re-run with `--cheapest` or `--fast`.
 - **`insufficient_funds`.** The swap amount plus gas is more than the ETH balance. Reduce the amount and keep a gas buffer.
 - **No route / quote failed.** Liquidity varies by chain. Try Ethereum, Arbitrum or Base, or bridge to one of those.
 - **Slippage on large size.** Weigh the swap quote against ether.fi's native mint. Pass `--slippage 0.5` to tighten it, or mint directly at [app.ether.fi](https://app.ether.fi) for large ETH amounts on mainnet.

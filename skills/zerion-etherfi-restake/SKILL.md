@@ -22,7 +22,7 @@ weETH is the wrapped, non-rebasing form of ether.fi's eETH. Its value per token 
 - `zerion swap <chain> <amount> ETH weETH` — same-chain ETH → weETH
 - `zerion bridge <from-chain> ETH <amount> <to-chain> weETH` — move ETH from another chain and land as weETH
 - `zerion positions <wallet> --positions simple` — confirm the weETH token balance
-- `zerion positions <wallet> --positions defi` — weETH deployed into protocols (lending, LP, vaults)
+- `zerion positions <wallet> --positions defi` — weETH deployed into protocols (lending, LP, ether.fi vaults; match by protocol)
 
 ## Requirements
 - Zerion CLI: `npm install -g zerion-cli`
@@ -109,8 +109,23 @@ zerion analyze restake --pretty
 
 A plain weETH balance will **not** appear under `--positions defi`. That filter is empty until weETH is deposited into a protocol. Use `--positions simple` or `--positions all` to confirm the swap landed.
 
+### 4. If the weETH went into an ether.fi vault (e.g. via Zerion Earn)
+
+Vault deposits do show under `--positions defi`, but **match on protocol, not symbol**. The position is valued in the vault's base asset, so weETH deposited into ether.fi Liquid ETH reports as **WETH**, not weETH:
+
+```bash
+zerion positions restake --positions defi --chain ethereum
+# look for: protocol "ether.fi", name "ether.fi Yield: WETH Pool", position_type "deposit"
+
+zerion positions restake --positions simple --chain ethereum
+# the vault share token (e.g. liquidETH) sits here as a wallet token
+```
+
+The same deposit can also appear a second time under protocol "Veda" (Veda runs ether.fi's vaults). Count it once when summing DeFi value.
+
 ## Common Blockers
 - **`--positions defi` is empty after the swap.** Expected: weETH held in the wallet is a token, not a protocol position. Check `--positions simple`.
+- **Vault deposit shows as WETH, not weETH.** ether.fi vault positions are valued in the vault's base asset. Filter by `protocol: ether.fi` instead of the weETH symbol.
 - **`insufficient_funds`.** The swap amount plus gas is more than the ETH balance. Reduce the amount and keep a gas buffer.
 - **No route / quote failed.** Liquidity varies by chain. Try Ethereum, Arbitrum or Base, or bridge to one of those.
 - **Slippage on large size.** Weigh the swap quote against ether.fi's native mint. Pass `--slippage 0.5` to tighten it, or mint directly at [app.ether.fi](https://app.ether.fi) for large ETH amounts on mainnet.

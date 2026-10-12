@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { formatBridgeOffers, formatDefiPositions } from "#zerion/utils/common/format.js";
+import { formatBridgeOffers, formatDefiPositions, formatPositions } from "#zerion/utils/common/format.js";
 
 const SAMPLE = {
   fromChain: "base",
@@ -230,5 +230,47 @@ describe("formatDefiPositions", () => {
     });
     assert.match(out, /DeFi Positions/);
     assert.match(out, /no DeFi positions/);
+  });
+});
+
+describe("formatPositions", () => {
+  const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const row = (over) => ({
+    name: "Wrapped Ether", symbol: "WETH", chain: "ethereum", quantity: 1, value: 4000,
+    price: 4000, change_absolute_1d: null, change_percent_1d: null,
+    protocol: null, position_type: "wallet", position_name: null, dapp: null, ...over,
+  });
+
+  it("shows a Protocol column with each DeFi row's protocol", () => {
+    const out = strip(formatPositions({
+      wallet: { name: "w", address: "0xabc" },
+      positions: [
+        row({ protocol: "ether.fi", position_type: "deposit", dapp: "ether-fi" }),
+        row({ protocol: "Veda", position_type: "deposit", dapp: "veda" }),
+      ],
+      count: 2,
+    }));
+    assert.match(out, /Protocol/);
+    assert.match(out, /WETH\s+ether\.fi\s+ethereum/);
+    assert.match(out, /WETH\s+Veda\s+ethereum/);
+  });
+
+  it("keeps the original layout when no row has a protocol", () => {
+    const out = strip(formatPositions({
+      wallet: { name: "w", address: "0xabc" },
+      positions: [row({})],
+      count: 1,
+    }));
+    assert.doesNotMatch(out, /Protocol/);
+    assert.match(out, /WETH\s+ethereum/);
+  });
+
+  it("truncates long protocol names so columns stay aligned", () => {
+    const out = strip(formatPositions({
+      wallet: { name: "w", address: "0xabc" },
+      positions: [row({ protocol: "A Very Long Protocol Name" })],
+      count: 1,
+    }));
+    assert.match(out, /A Very Long P…\s+ethereum/);
   });
 });

@@ -117,15 +117,20 @@ export function formatPortfolio(data) {
 
 export function formatPositions(data) {
   const walletLabel = data.wallet.name || data.wallet.address.slice(0, 10) + "...";
+  // Protocol column only appears when some row is a DeFi position, so plain
+  // wallet holdings keep the original table layout.
+  const showProtocol = data.positions.some((p) => p.protocol);
+  const protocolHeader = showProtocol ? ` ${pad("Protocol", 14)}` : "";
   const lines = [
     `${BOLD}Positions${RESET} — ${walletLabel} (${data.count})\n`,
-    `  ${DIM}${pad("Token", 16)} ${pad("Chain", 12)} ${padStart("Value", 12)} ${padStart("24h", 18)} ${padStart("Amount", 16)}${RESET}`,
-    `  ${DIM}${"─".repeat(76)}${RESET}`,
+    `  ${DIM}${pad("Token", 16)}${protocolHeader} ${pad("Chain", 12)} ${padStart("Value", 12)} ${padStart("24h", 18)} ${padStart("Amount", 16)}${RESET}`,
+    `  ${DIM}${"─".repeat(showProtocol ? 91 : 76)}${RESET}`,
   ];
   for (const p of data.positions) {
     const change = formatChange(p);
+    const protocolCell = showProtocol ? ` ${padTrunc(p.protocol || "-", 14)}` : "";
     lines.push(
-      `  ${pad(p.symbol || "?", 16)} ${pad(p.chain || "?", 12)} ${padStart(usd(p.value), 12)} ${padStart(change, 28)} ${padStart(p.quantity?.toFixed(4) || "-", 16)}`
+      `  ${pad(p.symbol || "?", 16)}${protocolCell} ${pad(p.chain || "?", 12)} ${padStart(usd(p.value), 12)} ${padStart(change, 28)} ${padStart(p.quantity?.toFixed(4) || "-", 16)}`
     );
   }
   return lines.join("\n");

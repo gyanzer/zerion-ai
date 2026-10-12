@@ -76,16 +76,7 @@ export default async function walletPositions(args, flags) {
     }
 
     const positions = (response.data || [])
-      .map((p) => ({
-        name: p.attributes.fungible_info?.name ?? p.attributes.name ?? "Unknown",
-        symbol: p.attributes.fungible_info?.symbol ?? null,
-        chain: p.relationships?.chain?.data?.id ?? null,
-        quantity: p.attributes.quantity?.float ?? null,
-        value: p.attributes.value ?? 0,
-        price: p.attributes.price ?? null,
-        change_absolute_1d: p.attributes.changes?.absolute_1d ?? null,
-        change_percent_1d: p.attributes.changes?.percent_1d ?? null,
-      }))
+      .map(toPosition)
       .filter((p) => p.value > 0)
       .sort((a, b) => b.value - a.value);
 
@@ -99,6 +90,27 @@ export default async function walletPositions(args, flags) {
     printError(err.code || "positions_error", err.message);
     process.exit(1);
   }
+}
+
+// Flat position row. protocol / position_type / position_name / dapp let
+// agents tell DeFi positions apart: e.g. a weETH deposit into ether.fi Liquid
+// ETH surfaces as two WETH rows, one attributed to ether.fi and one to Veda.
+export function toPosition(p) {
+  const a = p.attributes || {};
+  return {
+    name: a.fungible_info?.name ?? a.name ?? "Unknown",
+    symbol: a.fungible_info?.symbol ?? null,
+    chain: p.relationships?.chain?.data?.id ?? null,
+    quantity: a.quantity?.float ?? null,
+    value: a.value ?? 0,
+    price: a.price ?? null,
+    change_absolute_1d: a.changes?.absolute_1d ?? null,
+    change_percent_1d: a.changes?.percent_1d ?? null,
+    protocol: a.protocol ?? null,
+    position_type: a.position_type ?? null,
+    position_name: a.name ?? null,
+    dapp: p.relationships?.dapp?.data?.id ?? null,
+  };
 }
 
 function toDefiPosition(p) {

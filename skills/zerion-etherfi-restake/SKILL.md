@@ -23,8 +23,6 @@ weETH is the wrapped, non-rebasing form of ether.fi's eETH. Its value per token 
 - `zerion bridge <from-chain> ETH <amount> <to-chain> weETH` — move ETH from another chain and land as weETH
 - `zerion positions <wallet> --positions simple` — confirm the weETH token balance
 - `zerion positions <wallet> --positions defi` — weETH deployed into protocols (lending, LP, ether.fi vaults; match by protocol)
-- `zerion wallet sync --wallet <wallet>` — link the CLI wallet to the Zerion app so the user can finish in Earn (`zerion://earn`)
-
 ## Requirements
 - Zerion CLI: `npm install -g zerion-cli`
 - Zerion API key: `export ZERION_API_KEY="zk_..."` (get one at [dashboard.zerion.io](https://dashboard.zerion.io))
@@ -110,18 +108,7 @@ zerion analyze restake --pretty
 
 A plain weETH balance will **not** appear under `--positions defi`. That filter is empty until weETH is deposited into a protocol. Use `--positions simple` or `--positions all` to confirm the swap landed.
 
-### 4. Optional: put the weETH to work in Zerion Earn
-
-The CLI has no deposit command for vaults. Zerion Earn lives in the Zerion app, so hand the last step to the user:
-
-```bash
-# Make the CLI wallet visible in the Zerion app (scan the QR with the app)
-zerion wallet sync --wallet restake
-```
-
-Then give the user this deep link to open on their phone: `zerion://earn`. It opens the Earn screen, where they pick a vault and sign the deposit. Once they confirm it's done, run step 5.
-
-### 5. If the weETH went into an ether.fi vault (e.g. via Zerion Earn)
+### 4. If the weETH went into an ether.fi vault (e.g. via Zerion Earn)
 
 Vault deposits do show under `--positions defi`, but **match on protocol, not symbol**. The position is valued in the vault's base asset, so weETH deposited into ether.fi Liquid ETH reports as **WETH**, not weETH:
 
